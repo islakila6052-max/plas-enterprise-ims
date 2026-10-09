@@ -1,0 +1,16 @@
+-- ============================================================================
+-- Internship Management System (IMS) — DATABASE SCHEMA (legacy combined file)
+-- ============================================================================
+-- This file is kept for reference only. The DEFINITIVE, reconciled schema is:
+--
+--   * DATABASE_SCHEMA.sql                      (single-file, paste-into-SQL-Editor)
+--   * supabase/migrations/0001_init.sql        (enums + tables + indexes)
+--   * supabase/migrations/0002_rls.sql         (functions + trigger + RLS + storage)
+--   * supabase/migrations/0003_prototype_fields.sql (pinned, file_name)
+--   * supabase/migrations/0004_consistency.sql (profile links, cascade, enum,
+--                                                constraints, triggers)
+--
+-- To recreate the database from scratch, run DATABASE_SCHEMA.sql (it is
+-- idempotent and includes everything above). Do NOT maintain this file
+-- separately — edit the migrations / DATABASE_SCHEMA.sql instead.
+-- ============================================================================

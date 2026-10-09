@@ -1,0 +1,37 @@
+# Dependabot keeps the dependency set patched (L1).
+# npm audit reported 9 vulnerabilities before the security pass, including a
+# react-router open-redirect-to-XSS (GHSA-jjmj-jmhj-qwj2 / GHSA-wrjc-x8rr-h8h6)
+# and DOMPurify XSS (GHSA-...). Automated PRs keep them from silently returning.
+version: 2
+updates:
+  # Runtime dependencies - security relevant, reviewed every PR.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # Keep security patches together so they are quick to review and merge.
+      security:
+        applies-to: version-updates
+        types:
+          - "security"
+      minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "security"
+
+  # GitHub Actions supply chain.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "security"

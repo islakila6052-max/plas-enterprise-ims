@@ -1,0 +1,1537 @@
+-- ============================================================================
+-- PLAS ENTERPRISE IMS - UNIFIED REBUILD (single file, repaired)
+-- Target: Supabase Postgres 15+ | Run in the SQL Editor
+--
+-- !! BEFORE YOU RUN !!
+--   1. Search for CHANGE_ME@example.com (near the bottom) and put YOUR admin
+--      login email there. Otherwise nobody becomes admin.
+--   2. This DELETES all data in the public tables. Back up first if needed.
+--
+-- The whole script runs in ONE transaction: if anything fails, everything
+-- (including the drops) is rolled back.
+--
+-- No SELECT ... INTO is used anywhere (assignments / FOR loops instead).
+-- ============================================================================
+
+BEGIN;
+
+-- ============================================================================
+-- 0. TEARDOWN
+-- ============================================================================
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+
+-- storage policies (they depend on public functions)
+DROP POLICY IF EXISTS "documents storage readable" ON storage.objects;
+DROP POLICY IF EXISTS "intern uploads own documents" ON storage.objects;
+DROP POLICY IF EXISTS "admins manage storage" ON storage.objects;
+DROP POLICY IF EXISTS "intern deletes own document object" ON storage.objects;
+DROP POLICY IF EXISTS "intern documents private read" ON storage.objects;
+DROP POLICY IF EXISTS "intern documents owner write" ON storage.objects;
+DROP POLICY IF EXISTS "intern documents owner delete" ON storage.objects;
+DROP POLICY IF EXISTS "intern documents admin manage" ON storage.objects;
+DROP POLICY IF EXISTS "moa_admin_upload" ON storage.objects;
+DROP POLICY IF EXISTS "moa_admin_read" ON storage.objects;
+DROP POLICY IF EXISTS "moa_admin_delete" ON storage.objects;
+DROP POLICY IF EXISTS "institution_logos_admin_upload" ON storage.objects;
+DROP POLICY IF EXISTS "institution_logos_public_read" ON storage.objects;
+DROP POLICY IF EXISTS "institution_logos_admin_delete" ON storage.objects;
+
+-- functions
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN
+    SELECT format('%I.%I(%s)', n.nspname, p.proname,
+                  pg_get_function_identity_arguments(p.oid)) AS sig
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND p.proname IN (
+         'current_role','is_admin','current_intern_id','current_supervisor_id',
+         'current_supervisor_department_id','current_supervisor_intern_ids',
+         'can_delete_users','can_manage_settings','handle_new_user',
+         'sync_profile_links','ensure_role_rows','touch_updated_at',
+         'update_updated_at_column','audit_profile_changes',
+         'guard_profile_columns','profile_ids_by_role',
+         'supervisor_profile_id','intern_profile_id','update_own_profile',
+         'notify_user','notify_role','write_audit_log','attendance_today',
+         'attendance_hours','attendance_clock_in','attendance_clock_out',
+         'attendance_submit_claim','attendance_review_claim','journal_review',
+         'document_review','evaluation_create','announcement_create',
+         'announcement_update','announcement_delete','get_intern_stats',
+         'get_supervisor_stats','get_admin_stats')
+  LOOP
+    EXECUTE 'DROP FUNCTION IF EXISTS ' || r.sig || ' CASCADE';
+  END LOOP;
+END $$;
+
+-- tables (CASCADE also removes their triggers, policies, indexes)
+DROP TABLE IF EXISTS public.announcement_likes CASCADE;
+DROP TABLE IF EXISTS public.audit_logs CASCADE;
+DROP TABLE IF EXISTS public.notifications CASCADE;
+DROP TABLE IF EXISTS public.announcements CASCADE;
+DROP TABLE IF EXISTS public.evaluations CASCADE;
+DROP TABLE IF EXISTS public.documents CASCADE;
+DROP TABLE IF EXISTS public.daily_journals CASCADE;
+DROP TABLE IF EXISTS public.attendance CASCADE;
+DROP TABLE IF EXISTS public.interns CASCADE;
+DROP TABLE IF EXISTS public.programs CASCADE;
+DROP TABLE IF EXISTS public.institutions CASCADE;
+DROP TABLE IF EXISTS public.supervisors CASCADE;
+DROP TABLE IF EXISTS public.profiles CASCADE;
+DROP TABLE IF EXISTS public.departments CASCADE;
+DROP TABLE IF EXISTS public.settings CASCADE;
+
+DROP TYPE IF EXISTS public.user_role CASCADE;
+DROP TYPE IF EXISTS public.intern_status CASCADE;
+DROP TYPE IF EXISTS public.attendance_status CASCADE;
+DROP TYPE IF EXISTS public.journal_status CASCADE;
+DROP TYPE IF EXISTS public.document_status CASCADE;
+DROP TYPE IF EXISTS public.evaluation_status CASCADE;
+
+
+-- ============================================================================
+-- 1. TYPES
+-- ============================================================================
+CREATE TYPE public.user_role AS ENUM ('admin','hr_staff','supervisor','intern');
+CREATE TYPE public.intern_status AS ENUM ('active','completed','archived');
+CREATE TYPE public.attendance_status AS ENUM ('present','late','absent','pending');
+CREATE TYPE public.journal_status AS ENUM ('pending','approved','rejected');
+CREATE TYPE public.document_status AS ENUM ('pending','approved','rejected');
+CREATE TYPE public.evaluation_status AS ENUM ('pending','completed','archived');
+
+
+-- ============================================================================
+-- 2. TABLES
+-- ============================================================================
+CREATE TABLE public.departments (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name        text NOT NULL UNIQUE,
+  description text,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.profiles (
+  id             uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  full_name      text NOT NULL DEFAULT '',
+  email          text,
+  avatar_url     text,
+  contact_number text,
+  bio            text,
+  role           public.user_role NOT NULL DEFAULT 'intern',
+  intern_id      uuid,
+  supervisor_id  uuid,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.supervisors (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  profile_id    uuid UNIQUE REFERENCES public.profiles(id) ON DELETE CASCADE,
+  department_id uuid REFERENCES public.departments(id) ON DELETE SET NULL,
+  first_name    text NOT NULL DEFAULT '',
+  last_name     text,
+  email         text,
+  created_by    uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE public.supervisors ADD COLUMN full_name text GENERATED ALWAYS AS
+  (btrim(coalesce(first_name,'') || ' ' || coalesce(last_name,''))) STORED;
+
+CREATE TABLE public.institutions (
+  institution_id   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  institution_name text NOT NULL,
+  abbreviation     text,
+  campus           text,
+  address          text,
+  contact_person   text,
+  contact_number   text,
+  email            text,
+  logo_url         text,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.programs (
+  program_id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  institution_id    uuid NOT NULL REFERENCES public.institutions(institution_id) ON DELETE CASCADE,
+  program_name      text NOT NULL,
+  abbreviation      text,
+  program_code      text,
+  required_hours    numeric NOT NULL DEFAULT 300 CHECK (required_hours >= 0),
+  memo_of_agreement text,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.interns (
+  id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  profile_id        uuid UNIQUE REFERENCES public.profiles(id) ON DELETE CASCADE,
+  first_name        text NOT NULL DEFAULT '',
+  last_name         text,
+  email             text,
+  contact_number    text,
+  emergency_contact text,
+  student_number    text,
+  school            text,
+  course            text,
+  department_id     uuid REFERENCES public.departments(id) ON DELETE SET NULL,
+  supervisor_id     uuid REFERENCES public.supervisors(id) ON DELETE SET NULL,
+  institution_id    uuid REFERENCES public.institutions(institution_id) ON DELETE SET NULL,
+  program_id        uuid REFERENCES public.programs(program_id) ON DELETE SET NULL,
+  start_date        date,
+  end_date          date,
+  required_hours    numeric NOT NULL DEFAULT 300 CHECK (required_hours >= 0),
+  status            public.intern_status NOT NULL DEFAULT 'active',
+  created_by        uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now()
+);
+
+-- profile -> role-row links (added after both tables exist)
+ALTER TABLE public.profiles
+  ADD CONSTRAINT profiles_intern_fk
+  FOREIGN KEY (intern_id) REFERENCES public.interns(id) ON DELETE SET NULL;
+ALTER TABLE public.profiles
+  ADD CONSTRAINT profiles_supervisor_fk
+  FOREIGN KEY (supervisor_id) REFERENCES public.supervisors(id) ON DELETE SET NULL;
+
+CREATE TABLE public.attendance (
+  id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  intern_id            uuid NOT NULL REFERENCES public.interns(id) ON DELETE CASCADE,
+  date                 date NOT NULL DEFAULT (now() AT TIME ZONE 'Asia/Manila')::date,
+  time_in              timestamptz,
+  time_out             timestamptz,
+  total_hours          numeric NOT NULL DEFAULT 0 CHECK (total_hours >= 0),
+  method               text NOT NULL DEFAULT 'manual',
+  status               public.attendance_status NOT NULL DEFAULT 'pending',
+  remarks              text,
+  claimed_time_out     timestamptz,
+  claim_status         text CHECK (claim_status IN ('pending','approved','rejected')),
+  claim_remarks        text,
+  claim_reviewed_by    uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  claim_reviewed_at    timestamptz,
+  claim_review_comment text,
+  created_at           timestamptz NOT NULL DEFAULT now(),
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  CHECK (time_out IS NULL OR time_in IS NULL OR time_out > time_in),
+  CHECK (claimed_time_out IS NULL OR time_in IS NULL OR claimed_time_out > time_in)
+);
+
+CREATE TABLE public.daily_journals (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  intern_id          uuid NOT NULL REFERENCES public.interns(id) ON DELETE CASCADE,
+  supervisor_id      uuid REFERENCES public.supervisors(id) ON DELETE SET NULL,
+  date               date NOT NULL DEFAULT CURRENT_DATE,
+  activities         text NOT NULL,
+  hours_worked       numeric NOT NULL DEFAULT 0 CHECK (hours_worked >= 0),
+  challenges         text,
+  learnings          text,
+  status             public.journal_status NOT NULL DEFAULT 'pending',
+  supervisor_comment text,
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  updated_at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.documents (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  intern_id   uuid NOT NULL REFERENCES public.interns(id) ON DELETE CASCADE,
+  type        text NOT NULL CHECK (type IN ('resume','moa','endorsement',
+                'school_requirements','completion_report')),
+  label       text,
+  file_path   text,
+  file_url    text,
+  file_name   text,
+  file_size   integer CHECK (file_size IS NULL OR file_size >= 0),
+  mime_type   text,
+  status      public.document_status NOT NULL DEFAULT 'pending',
+  reviewed_by uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  reviewed_at timestamptz,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.evaluations (
+  id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  intern_id            uuid NOT NULL REFERENCES public.interns(id) ON DELETE CASCADE,
+  supervisor_id        uuid REFERENCES public.supervisors(id) ON DELETE SET NULL,
+  attendance           integer NOT NULL DEFAULT 0 CHECK (attendance BETWEEN 0 AND 5),
+  communication        integer NOT NULL DEFAULT 0 CHECK (communication BETWEEN 0 AND 5),
+  teamwork             integer NOT NULL DEFAULT 0 CHECK (teamwork BETWEEN 0 AND 5),
+  initiative           integer NOT NULL DEFAULT 0 CHECK (initiative BETWEEN 0 AND 5),
+  technical_skills     integer NOT NULL DEFAULT 0 CHECK (technical_skills BETWEEN 0 AND 5),
+  professionalism      integer NOT NULL DEFAULT 0 CHECK (professionalism BETWEEN 0 AND 5),
+  overall_rating       integer NOT NULL DEFAULT 0 CHECK (overall_rating BETWEEN 0 AND 5),
+  comments             text,
+  final_recommendation text CHECK (final_recommendation IS NULL OR final_recommendation IN
+                         ('highly_recommend','recommend','neutral','do_not_recommend')),
+  status               public.evaluation_status NOT NULL DEFAULT 'pending',
+  created_at           timestamptz NOT NULL DEFAULT now(),
+  updated_at           timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.announcements (
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  title        text NOT NULL CHECK (btrim(title) <> ''),
+  body         text NOT NULL,
+  category     text NOT NULL DEFAULT 'company_news'
+               CHECK (category IN ('company_news','schedule','deadline','reminder')),
+  pinned       boolean NOT NULL DEFAULT false,
+  published_by uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.announcement_likes (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  announcement_id uuid NOT NULL REFERENCES public.announcements(id) ON DELETE CASCADE,
+  user_id         uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT announcement_likes_unique UNIQUE (announcement_id, user_id)
+);
+
+CREATE TABLE public.settings (
+  id                  integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  company_name        text,
+  internship_duration text,
+  required_hours      numeric NOT NULL DEFAULT 300 CHECK (required_hours >= 0),
+  shift_start_minute  integer NOT NULL DEFAULT 780
+                      CHECK (shift_start_minute >= 0 AND shift_start_minute < 1440),
+  is_configured       boolean NOT NULL DEFAULT false,
+  updated_at          timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO public.settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE public.notifications (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  type       text NOT NULL CHECK (type IN ('announcement','journal_review',
+               'journal_reviewed','journal_submitted','document_review',
+               'evaluation_created','evaluation_submitted','attendance_reminder',
+               'attendance_update','account_created','intern_assigned',
+               'intern_status','supervisor_assigned','supervisor_added')),
+  title      text NOT NULL,
+  message    text NOT NULL,
+  link       text,
+  is_read    boolean NOT NULL DEFAULT false,
+  read_at    timestamptz,
+  metadata   jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.audit_logs (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  action        text NOT NULL CHECK (action IN ('create','update','delete','review','login')),
+  resource_type text NOT NULL,
+  resource_id   uuid,
+  changes       jsonb NOT NULL DEFAULT '{}'::jsonb,
+  ip_address    text,
+  user_agent    text,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+
+-- ============================================================================
+-- 3. INDEXES
+-- ============================================================================
+CREATE INDEX idx_profiles_role            ON public.profiles(role);
+CREATE INDEX idx_profiles_intern          ON public.profiles(intern_id);
+CREATE INDEX idx_profiles_supervisor      ON public.profiles(supervisor_id);
+CREATE INDEX idx_supervisors_department   ON public.supervisors(department_id);
+CREATE INDEX idx_supervisors_created_by   ON public.supervisors(created_by);
+CREATE INDEX idx_programs_institution     ON public.programs(institution_id);
+CREATE UNIQUE INDEX programs_program_code_per_inst_unique
+  ON public.programs (institution_id, program_code)
+  WHERE program_code IS NOT NULL AND program_code <> '';
+CREATE INDEX interns_department_idx       ON public.interns(department_id);
+CREATE INDEX interns_supervisor_idx       ON public.interns(supervisor_id);
+CREATE INDEX interns_status_idx           ON public.interns(status);
+CREATE INDEX idx_interns_institution      ON public.interns(institution_id);
+CREATE INDEX idx_interns_program          ON public.interns(program_id);
+CREATE INDEX idx_interns_created_by       ON public.interns(created_by);
+CREATE INDEX attendance_intern_idx        ON public.attendance(intern_id);
+CREATE INDEX attendance_date_idx          ON public.attendance(date);
+CREATE UNIQUE INDEX attendance_unique_per_day ON public.attendance(intern_id, date);
+CREATE INDEX idx_attendance_claim_status  ON public.attendance(claim_status)
+  WHERE claim_status IS NOT NULL;
+CREATE INDEX journals_intern_idx          ON public.daily_journals(intern_id);
+CREATE INDEX journals_status_idx          ON public.daily_journals(status);
+CREATE INDEX journals_supervisor_idx      ON public.daily_journals(supervisor_id);
+CREATE INDEX documents_intern_idx         ON public.documents(intern_id);
+CREATE INDEX documents_status_idx         ON public.documents(status);
+CREATE INDEX evaluations_intern_idx       ON public.evaluations(intern_id);
+CREATE INDEX evaluations_supervisor_idx   ON public.evaluations(supervisor_id);
+CREATE INDEX evaluations_status_idx       ON public.evaluations(status);
+CREATE INDEX announcements_pinned_idx     ON public.announcements(pinned);
+CREATE INDEX announcements_category_idx   ON public.announcements(category);
+CREATE INDEX announcement_likes_user_idx  ON public.announcement_likes(user_id);
+CREATE INDEX notifications_user_idx       ON public.notifications(user_id);
+CREATE INDEX notifications_unread_idx     ON public.notifications(user_id, is_read)
+  WHERE is_read = false;
+CREATE INDEX audit_logs_resource_idx      ON public.audit_logs(resource_type, resource_id);
+CREATE INDEX audit_logs_user_idx          ON public.audit_logs(user_id);
+
+
+-- ============================================================================
+-- 4. HELPER FUNCTIONS (role / identity)
+-- ============================================================================
+CREATE OR REPLACE FUNCTION public.current_role() RETURNS public.user_role
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT role FROM public.profiles WHERE id = auth.uid(); $$;
+
+CREATE OR REPLACE FUNCTION public.is_admin() RETURNS boolean
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT EXISTS (SELECT 1 FROM public.profiles
+       WHERE id = auth.uid() AND role IN ('admin','hr_staff')); $$;
+
+CREATE OR REPLACE FUNCTION public.can_delete_users() RETURNS boolean
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT EXISTS (SELECT 1 FROM public.profiles
+       WHERE id = auth.uid() AND role = 'admin'); $$;
+
+CREATE OR REPLACE FUNCTION public.can_manage_settings() RETURNS boolean
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT EXISTS (SELECT 1 FROM public.profiles
+       WHERE id = auth.uid() AND role IN ('admin','hr_staff')); $$;
+
+CREATE OR REPLACE FUNCTION public.current_intern_id() RETURNS uuid
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT COALESCE(
+       (SELECT i.id FROM public.interns i WHERE i.profile_id = auth.uid() LIMIT 1),
+       (SELECT p.intern_id FROM public.profiles p
+         WHERE p.id = auth.uid() AND p.intern_id IS NOT NULL LIMIT 1)); $$;
+
+CREATE OR REPLACE FUNCTION public.current_supervisor_id() RETURNS uuid
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT COALESCE(
+       (SELECT s.id FROM public.supervisors s WHERE s.profile_id = auth.uid() LIMIT 1),
+       (SELECT p.supervisor_id FROM public.profiles p
+         WHERE p.id = auth.uid() AND p.supervisor_id IS NOT NULL LIMIT 1)); $$;
+
+CREATE OR REPLACE FUNCTION public.current_supervisor_department_id() RETURNS uuid
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT s.department_id FROM public.supervisors s
+       WHERE s.id = public.current_supervisor_id() LIMIT 1; $$;
+
+CREATE OR REPLACE FUNCTION public.current_supervisor_intern_ids() RETURNS SETOF uuid
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT i.id FROM public.interns i
+       WHERE i.supervisor_id = public.current_supervisor_id(); $$;
+
+CREATE OR REPLACE FUNCTION public.profile_ids_by_role(p_role text) RETURNS SETOF uuid
+  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT p.id FROM public.profiles p WHERE p.role::text = p_role; $$;
+
+CREATE OR REPLACE FUNCTION public.supervisor_profile_id(p_supervisor_row_id uuid)
+  RETURNS uuid LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT p.id FROM public.profiles p
+       WHERE p.supervisor_id = p_supervisor_row_id LIMIT 1; $$;
+
+CREATE OR REPLACE FUNCTION public.intern_profile_id(p_intern_row_id uuid)
+  RETURNS uuid LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$ SELECT p.id FROM public.profiles p
+       WHERE p.intern_id = p_intern_row_id LIMIT 1; $$;
+
+CREATE OR REPLACE FUNCTION public.attendance_today() RETURNS date
+  LANGUAGE sql STABLE
+AS $$ SELECT (now() AT TIME ZONE 'Asia/Manila')::date; $$;
+
+CREATE OR REPLACE FUNCTION public.attendance_hours(p_time_in timestamptz,
+  p_time_out timestamptz) RETURNS numeric
+  LANGUAGE sql IMMUTABLE
+AS $$ SELECT CASE
+        WHEN p_time_in IS NULL OR p_time_out IS NULL THEN NULL
+        WHEN p_time_out <= p_time_in THEN 0
+        ELSE round((extract(epoch FROM (p_time_out - p_time_in)) / 3600.0)::numeric, 2)
+      END; $$;
+
+
+-- ============================================================================
+-- 5. WRITE RPCs (SECURITY DEFINER)
+-- ============================================================================
+
+-- ---- attendance: clock in --------------------------------------------------
+CREATE OR REPLACE FUNCTION public.attendance_clock_in(p_method text DEFAULT 'manual')
+  RETURNS public.attendance
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_intern uuid := public.current_intern_id();
+  v_today  date := public.attendance_today();
+  v_shift  integer;
+  v_row    public.attendance;
+BEGIN
+  IF v_intern IS NULL THEN
+    RAISE EXCEPTION 'No intern profile is linked to this account.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM public.attendance
+              WHERE intern_id = v_intern AND date = v_today) THEN
+    RAISE EXCEPTION 'You have already submitted your attendance for today.'
+      USING ERRCODE = 'unique_violation';
+  END IF;
+
+  -- 780 = 13:00 Asia/Manila (fallback if settings row is missing)
+  v_shift := COALESCE(
+    (SELECT s.shift_start_minute FROM public.settings s WHERE s.id = 1), 780);
+
+  INSERT INTO public.attendance (intern_id, date, time_in, method, status)
+  VALUES (
+    v_intern, v_today, now(),
+    COALESCE(NULLIF(btrim(p_method), ''), 'manual'),
+    CASE
+      WHEN extract(hour   FROM now() AT TIME ZONE 'Asia/Manila') * 60
+         + extract(minute FROM now() AT TIME ZONE 'Asia/Manila') > v_shift
+      THEN 'late'::public.attendance_status
+      ELSE 'present'::public.attendance_status
+    END)
+  RETURNING * INTO v_row;
+
+  RETURN v_row;
+END;
+$$;
+
+-- ---- attendance: clock out -------------------------------------------------
+CREATE OR REPLACE FUNCTION public.attendance_clock_out(p_time_out timestamptz,
+  p_remarks text DEFAULT NULL)
+  RETURNS public.attendance
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_intern uuid := public.current_intern_id();
+  v_row    public.attendance;
+BEGIN
+  IF v_intern IS NULL THEN
+    RAISE EXCEPTION 'No intern profile is linked to this account.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  FOR v_row IN
+    SELECT * FROM public.attendance
+     WHERE intern_id = v_intern
+       AND date = public.attendance_today()
+       AND time_out IS NULL
+     ORDER BY time_in DESC
+     LIMIT 1
+     FOR UPDATE
+  LOOP
+    EXIT;
+  END LOOP;
+
+  IF v_row.id IS NULL THEN
+    RAISE EXCEPTION 'No open attendance record to close.'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF p_time_out IS NULL OR p_time_out <= v_row.time_in THEN
+    RAISE EXCEPTION 'Time out must be after time in.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF p_time_out > now() + interval '5 minutes' THEN
+    RAISE EXCEPTION 'Time out cannot be in the future.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  UPDATE public.attendance
+     SET time_out    = p_time_out,
+         total_hours = COALESCE(public.attendance_hours(v_row.time_in, p_time_out), 0),
+         remarks     = NULLIF(btrim(p_remarks), '')
+   WHERE id = v_row.id
+  RETURNING * INTO v_row;
+
+  RETURN v_row;
+END;
+$$;
+
+-- ---- attendance: submit missed clock-out claim -----------------------------
+CREATE OR REPLACE FUNCTION public.attendance_submit_claim(p_record_id uuid,
+  p_claimed_time_out timestamptz, p_remarks text DEFAULT NULL)
+  RETURNS public.attendance
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_intern uuid := public.current_intern_id();
+  v_row    public.attendance;
+BEGIN
+  IF v_intern IS NULL THEN
+    RAISE EXCEPTION 'No intern profile is linked to this account.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  FOR v_row IN
+    SELECT * FROM public.attendance
+     WHERE id = p_record_id AND intern_id = v_intern
+     FOR UPDATE
+  LOOP
+    EXIT;
+  END LOOP;
+
+  IF v_row.id IS NULL THEN
+    RAISE EXCEPTION 'Attendance record not found.'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+  IF v_row.time_out IS NOT NULL THEN
+    RAISE EXCEPTION 'This record is already closed.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  IF v_row.claim_status = 'pending' THEN
+    RAISE EXCEPTION 'You already have a pending claim.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  IF p_claimed_time_out IS NULL OR p_claimed_time_out <= v_row.time_in THEN
+    RAISE EXCEPTION 'Claimed time out must be after time in.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  UPDATE public.attendance
+     SET claimed_time_out     = p_claimed_time_out,
+         claim_status         = 'pending',
+         claim_remarks        = NULLIF(btrim(p_remarks), ''),
+         claim_reviewed_by    = NULL,
+         claim_reviewed_at    = NULL,
+         claim_review_comment = NULL
+   WHERE id = v_row.id
+  RETURNING * INTO v_row;
+
+  RETURN v_row;
+END;
+$$;
+
+-- ---- attendance: review claim ----------------------------------------------
+CREATE OR REPLACE FUNCTION public.attendance_review_claim(p_record_id uuid,
+  p_decision text, p_comment text DEFAULT NULL)
+  RETURNS public.attendance
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_row public.attendance;
+  v_sup uuid := public.current_supervisor_id();
+BEGIN
+  IF p_decision NOT IN ('approved','rejected') THEN
+    RAISE EXCEPTION 'Decision must be approved or rejected.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  FOR v_row IN
+    SELECT * FROM public.attendance WHERE id = p_record_id FOR UPDATE
+  LOOP
+    EXIT;
+  END LOOP;
+
+  IF v_row.id IS NULL THEN
+    RAISE EXCEPTION 'Attendance record not found.'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF NOT public.is_admin() THEN
+    IF v_sup IS NULL OR NOT EXISTS (
+         SELECT 1 FROM public.interns i
+          WHERE i.id = v_row.intern_id AND i.supervisor_id = v_sup) THEN
+      RAISE EXCEPTION 'You are not assigned to this intern.'
+        USING ERRCODE = 'insufficient_privilege';
+    END IF;
+  END IF;
+
+  IF v_row.claim_status IS NULL OR v_row.claim_status <> 'pending' THEN
+    RAISE EXCEPTION 'No pending claim exists for this record.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  UPDATE public.attendance
+     SET claim_status         = p_decision,
+         claim_reviewed_by    = auth.uid(),
+         claim_reviewed_at    = now(),
+         claim_review_comment = NULLIF(btrim(p_comment), ''),
+         remarks              = COALESCE(NULLIF(btrim(p_comment), ''), remarks),
+         time_out    = CASE WHEN p_decision = 'approved'
+                            THEN v_row.claimed_time_out ELSE time_out END,
+         total_hours = CASE WHEN p_decision = 'approved'
+                            THEN COALESCE(public.attendance_hours(v_row.time_in, v_row.claimed_time_out), 0)
+                            ELSE total_hours END,
+         method      = CASE WHEN p_decision = 'approved' THEN 'claimed' ELSE method END
+   WHERE id = v_row.id
+  RETURNING * INTO v_row;
+
+  RETURN v_row;
+END;
+$$;
+
+-- ---- journal review --------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.journal_review(p_journal_id uuid,
+  p_status text, p_comment text DEFAULT NULL)
+  RETURNS public.daily_journals
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_row public.daily_journals;
+  v_sup uuid := public.current_supervisor_id();
+BEGIN
+  IF p_status NOT IN ('pending','approved','rejected') THEN
+    RAISE EXCEPTION 'Invalid journal status.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  FOR v_row IN
+    SELECT * FROM public.daily_journals WHERE id = p_journal_id FOR UPDATE
+  LOOP
+    EXIT;
+  END LOOP;
+
+  IF v_row.id IS NULL THEN
+    RAISE EXCEPTION 'Journal entry not found.'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF NOT public.is_admin() THEN
+    IF v_sup IS NULL OR NOT EXISTS (
+         SELECT 1 FROM public.interns i
+          WHERE i.id = v_row.intern_id AND i.supervisor_id = v_sup) THEN
+      RAISE EXCEPTION 'You are not assigned to this intern.'
+        USING ERRCODE = 'insufficient_privilege';
+    END IF;
+  END IF;
+
+  UPDATE public.daily_journals
+     SET status             = p_status::public.journal_status,
+         supervisor_comment = NULLIF(btrim(p_comment), ''),
+         supervisor_id      = COALESCE(v_sup, supervisor_id)
+   WHERE id = v_row.id
+  RETURNING * INTO v_row;
+
+  RETURN v_row;
+END;
+$$;
+
+-- ---- document review -------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.document_review(p_document_id uuid, p_status text)
+  RETURNS public.documents
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_row public.documents;
+BEGIN
+  IF p_status NOT IN ('pending','approved','rejected') THEN
+    RAISE EXCEPTION 'Invalid document status.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  IF NOT public.is_admin() THEN
+    RAISE EXCEPTION 'Only administrators may review documents.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  UPDATE public.documents
+     SET status      = p_status::public.document_status,
+         reviewed_by = auth.uid(),
+         reviewed_at = now()
+   WHERE id = p_document_id
+  RETURNING * INTO v_row;
+
+  IF v_row.id IS NULL THEN
+    RAISE EXCEPTION 'Document not found.'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  RETURN v_row;
+END;
+$$;
+
+-- ---- evaluation create -----------------------------------------------------
+CREATE OR REPLACE FUNCTION public.evaluation_create(
+  p_intern_id uuid,
+  p_attendance integer,
+  p_communication integer,
+  p_teamwork integer,
+  p_initiative integer,
+  p_technical_skills integer,
+  p_professionalism integer,
+  p_overall_rating integer,
+  p_comments text DEFAULT NULL,
+  p_final_recommendation text DEFAULT NULL)
+  RETURNS public.evaluations
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_sup uuid := public.current_supervisor_id();
+  v_row public.evaluations;
+BEGIN
+  IF v_sup IS NULL THEN
+    RAISE EXCEPTION 'Only supervisors may submit evaluations.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM public.interns i
+                  WHERE i.id = p_intern_id AND i.supervisor_id = v_sup) THEN
+    RAISE EXCEPTION 'You are not assigned to this intern.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF p_final_recommendation IS NOT NULL AND p_final_recommendation NOT IN
+     ('highly_recommend','recommend','neutral','do_not_recommend') THEN
+    RAISE EXCEPTION 'Invalid final recommendation.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  INSERT INTO public.evaluations (
+    intern_id, supervisor_id, attendance, communication, teamwork,
+    initiative, technical_skills, professionalism, overall_rating,
+    comments, final_recommendation)
+  VALUES (
+    p_intern_id, v_sup,
+    COALESCE(p_attendance, 0), COALESCE(p_communication, 0),
+    COALESCE(p_teamwork, 0), COALESCE(p_initiative, 0),
+    COALESCE(p_technical_skills, 0), COALESCE(p_professionalism, 0),
+    COALESCE(p_overall_rating, 0),
+    NULLIF(btrim(p_comments), ''), p_final_recommendation)
+  RETURNING * INTO v_row;
+
+  RETURN v_row;
+END;
+$$;
+
+-- ---- notifications ---------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.notify_user(p_user_id uuid, p_type text,
+  p_title text, p_message text, p_link text DEFAULT NULL,
+  p_metadata jsonb DEFAULT '{}'::jsonb)
+  RETURNS uuid
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_id uuid;
+BEGIN
+  IF p_user_id IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  INSERT INTO public.notifications (user_id, type, title, message, link, metadata)
+  VALUES (p_user_id, p_type, p_title, p_message, NULLIF(btrim(p_link), ''),
+          COALESCE(p_metadata, '{}'::jsonb))
+  RETURNING id INTO v_id;
+
+  RETURN v_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.notify_role(p_role text, p_type text,
+  p_title text, p_message text, p_link text DEFAULT NULL,
+  p_metadata jsonb DEFAULT '{}'::jsonb)
+  RETURNS integer
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_n integer := 0;
+BEGIN
+  INSERT INTO public.notifications (user_id, type, title, message, link, metadata)
+  SELECT p.id, p_type, p_title, p_message, NULLIF(btrim(p_link), ''),
+         COALESCE(p_metadata, '{}'::jsonb)
+    FROM public.profiles p
+   WHERE p.role::text = p_role;
+
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  RETURN v_n;
+END;
+$$;
+
+-- ---- audit log -------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.write_audit_log(p_action text,
+  p_resource_type text, p_resource_id uuid DEFAULT NULL,
+  p_changes jsonb DEFAULT '{}'::jsonb)
+  RETURNS uuid
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_id uuid;
+  v_ip text;
+  v_ua text;
+BEGIN
+  BEGIN
+    v_ip := NULLIF(btrim(current_setting('request.headers', true)::jsonb
+                         ->> 'x-forwarded-for'), '');
+  EXCEPTION WHEN OTHERS THEN
+    v_ip := NULL;
+  END;
+
+  BEGIN
+    v_ua := NULLIF(left(btrim(current_setting('request.headers', true)::jsonb
+                              ->> 'user-agent'), 512), '');
+  EXCEPTION WHEN OTHERS THEN
+    v_ua := NULL;
+  END;
+
+  INSERT INTO public.audit_logs (user_id, action, resource_type, resource_id,
+                                 changes, ip_address, user_agent)
+  VALUES (auth.uid(), p_action, p_resource_type, p_resource_id,
+          COALESCE(p_changes, '{}'::jsonb), v_ip, v_ua)
+  RETURNING id INTO v_id;
+
+  RETURN v_id;
+END;
+$$;
+
+-- ---- announcements (audited) -----------------------------------------------
+CREATE OR REPLACE FUNCTION public.announcement_create(p_title text, p_body text,
+  p_category text DEFAULT 'company_news', p_pinned boolean DEFAULT false)
+  RETURNS public.announcements
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_row public.announcements;
+BEGIN
+  IF NOT public.is_admin() THEN
+    RAISE EXCEPTION 'Only administrators may manage announcements.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF NULLIF(btrim(p_title), '') IS NULL OR NULLIF(btrim(p_body), '') IS NULL THEN
+    RAISE EXCEPTION 'Title and body are required.'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  INSERT INTO public.announcements (title, body, category, pinned, published_by)
+  VALUES (btrim(p_title), btrim(p_body),
+          COALESCE(p_category, 'company_news'), COALESCE(p_pinned, false),
+          auth.uid())
+  RETURNING * INTO v_row;
+
+  PERFORM public.write_audit_log('create', 'announcement', v_row.id,
+    jsonb_build_object('title', v_row.title, 'category', v_row.category,
+                       'pinned', v_row.pinned));
+  RETURN v_row;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.announcement_update(p_id uuid,
+  p_title text DEFAULT NULL, p_body text DEFAULT NULL,
+  p_category text DEFAULT NULL, p_pinned boolean DEFAULT NULL)
+  RETURNS public.announcements
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_before public.announcements;
+  v_row    public.announcements;
+BEGIN
+  IF NOT public.is_admin() THEN
+    RAISE EXCEPTION 'Only administrators may manage announcements.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  FOR v_before IN SELECT * FROM public.announcements WHERE id = p_id LOOP
+    EXIT;
+  END LOOP;
+
+  IF v_before.id IS NULL THEN
+    RAISE EXCEPTION 'Announcement not found.'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  UPDATE public.announcements
+     SET title    = COALESCE(NULLIF(btrim(p_title), ''), title),
+         body     = COALESCE(NULLIF(btrim(p_body), ''), body),
+         category = COALESCE(p_category, category),
+         pinned   = COALESCE(p_pinned, pinned)
+   WHERE id = p_id
+  RETURNING * INTO v_row;
+
+  PERFORM public.write_audit_log('update', 'announcement', v_row.id,
+    jsonb_build_object('title_before', v_before.title, 'title_after', v_row.title,
+                       'pinned_before', v_before.pinned, 'pinned_after', v_row.pinned));
+  RETURN v_row;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.announcement_delete(p_id uuid)
+  RETURNS boolean
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_before public.announcements;
+BEGIN
+  IF NOT public.is_admin() THEN
+    RAISE EXCEPTION 'Only administrators may manage announcements.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  FOR v_before IN SELECT * FROM public.announcements WHERE id = p_id LOOP
+    EXIT;
+  END LOOP;
+
+  IF v_before.id IS NULL THEN
+    RAISE EXCEPTION 'Announcement not found.'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  DELETE FROM public.announcements WHERE id = p_id;
+
+  PERFORM public.write_audit_log('delete', 'announcement', p_id,
+    jsonb_build_object('title', v_before.title, 'body', v_before.body,
+                       'category', v_before.category));
+  RETURN true;
+END;
+$$;
+
+-- ---- self-service profile update (column allowlist) ------------------------
+CREATE OR REPLACE FUNCTION public.update_own_profile(
+  p_full_name text DEFAULT NULL, p_contact_number text DEFAULT NULL,
+  p_bio text DEFAULT NULL, p_avatar_url text DEFAULT NULL)
+  RETURNS public.profiles
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_row public.profiles;
+BEGIN
+  UPDATE public.profiles
+     SET full_name      = COALESCE(p_full_name, full_name),
+         contact_number = COALESCE(p_contact_number, contact_number),
+         bio            = COALESCE(p_bio, bio),
+         avatar_url     = COALESCE(p_avatar_url, avatar_url)
+   WHERE id = auth.uid()
+  RETURNING * INTO v_row;
+
+  IF v_row.id IS NULL THEN
+    RAISE EXCEPTION 'Profile not found for the current user'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  RETURN v_row;
+END;
+$$;
+
+
+-- ============================================================================
+-- 6. TRIGGER FUNCTIONS
+-- ============================================================================
+
+-- New auth user -> profile (role is ALWAYS 'intern'; never read from metadata)
+CREATE OR REPLACE FUNCTION public.handle_new_user() RETURNS trigger
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+  INSERT INTO public.profiles (id, full_name, email, role)
+  VALUES (NEW.id, COALESCE(NEW.raw_user_meta_data ->> 'full_name', ''),
+          NEW.email, 'intern')
+  ON CONFLICT (id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+-- Profile role -> make sure the matching interns / supervisors row exists
+CREATE OR REPLACE FUNCTION public.ensure_role_rows() RETURNS trigger
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_dept uuid;
+  v_make boolean := false;
+  v_full text;
+  v_first text;
+  v_last text;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    v_make := true;
+  ELSIF TG_OP = 'UPDATE' THEN
+    v_make := (OLD.role IS DISTINCT FROM NEW.role);
+  END IF;
+
+  IF NOT v_make THEN
+    RETURN NEW;
+  END IF;
+
+  v_full  := btrim(COALESCE(NEW.full_name, ''));
+  v_first := COALESCE(NULLIF(split_part(v_full, ' ', 1), ''), '');
+  v_last  := NULLIF(btrim(regexp_replace(v_full, '^\S+\s*', '')), '');
+  v_dept  := (SELECT d.id FROM public.departments d ORDER BY d.id LIMIT 1);
+
+  IF NEW.role = 'intern' AND NOT EXISTS
+     (SELECT 1 FROM public.interns i WHERE i.profile_id = NEW.id) THEN
+    INSERT INTO public.interns (profile_id, first_name, last_name, email,
+                                status, required_hours, department_id)
+    VALUES (NEW.id, v_first, v_last, NEW.email, 'active', 300, v_dept);
+  END IF;
+
+  IF NEW.role = 'supervisor' AND NOT EXISTS
+     (SELECT 1 FROM public.supervisors s WHERE s.profile_id = NEW.id) THEN
+    INSERT INTO public.supervisors (profile_id, first_name, last_name, email,
+                                    department_id)
+    VALUES (NEW.id, v_first, v_last, NEW.email, v_dept);
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+-- Keep profiles.intern_id / supervisor_id in sync with the role tables
+CREATE OR REPLACE FUNCTION public.sync_profile_links() RETURNS trigger
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+  IF TG_TABLE_NAME = 'interns' THEN
+    IF TG_OP = 'DELETE' THEN
+      UPDATE public.profiles SET intern_id = NULL WHERE intern_id = OLD.id;
+      RETURN OLD;
+    ELSIF NEW.profile_id IS NOT NULL THEN
+      UPDATE public.profiles SET intern_id = NEW.id WHERE id = NEW.profile_id;
+    END IF;
+    RETURN NEW;
+  ELSIF TG_TABLE_NAME = 'supervisors' THEN
+    IF TG_OP = 'DELETE' THEN
+      UPDATE public.profiles SET supervisor_id = NULL WHERE supervisor_id = OLD.id;
+      RETURN OLD;
+    ELSIF NEW.profile_id IS NOT NULL THEN
+      UPDATE public.profiles SET supervisor_id = NEW.id WHERE id = NEW.profile_id;
+    END IF;
+    RETURN NEW;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.touch_updated_at() RETURNS trigger
+  LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+-- Block privilege escalation: normal users cannot change role / email / links.
+-- Skipped for service-role / SQL-editor calls (auth.uid() is null) and for
+-- updates made by other triggers (pg_trigger_depth() > 1).
+CREATE OR REPLACE FUNCTION public.guard_profile_columns() RETURNS trigger
+  LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF pg_trigger_depth() > 1 OR auth.uid() IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.role IS DISTINCT FROM OLD.role AND NOT public.can_delete_users() THEN
+    RAISE EXCEPTION 'Only an administrator can change a role.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  IF NOT public.is_admin() AND (
+       NEW.id            IS DISTINCT FROM OLD.id
+    OR NEW.email         IS DISTINCT FROM OLD.email
+    OR NEW.intern_id     IS DISTINCT FROM OLD.intern_id
+    OR NEW.supervisor_id IS DISTINCT FROM OLD.supervisor_id) THEN
+    RAISE EXCEPTION 'You are not allowed to change email or account links.'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.audit_profile_changes() RETURNS trigger
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_changes jsonb := '{}'::jsonb;
+BEGIN
+  IF NEW.full_name IS DISTINCT FROM OLD.full_name THEN
+    v_changes := jsonb_set(v_changes, '{full_name}',
+      jsonb_build_object('from', OLD.full_name, 'to', NEW.full_name));
+  END IF;
+  IF NEW.contact_number IS DISTINCT FROM OLD.contact_number THEN
+    v_changes := jsonb_set(v_changes, '{contact_number}',
+      jsonb_build_object('from', OLD.contact_number, 'to', NEW.contact_number));
+  END IF;
+  IF NEW.bio IS DISTINCT FROM OLD.bio THEN
+    v_changes := jsonb_set(v_changes, '{bio}',
+      jsonb_build_object('from', OLD.bio, 'to', NEW.bio));
+  END IF;
+  IF NEW.role IS DISTINCT FROM OLD.role THEN
+    v_changes := jsonb_set(v_changes, '{role}',
+      jsonb_build_object('from', OLD.role, 'to', NEW.role));
+  END IF;
+
+  IF v_changes = '{}'::jsonb THEN
+    RETURN NULL;
+  END IF;
+
+  INSERT INTO public.audit_logs (user_id, action, resource_type, resource_id, changes)
+  VALUES (auth.uid(), 'update', 'profile', NEW.id, v_changes);
+  RETURN NULL;
+END;
+$$;
+
+
+-- ============================================================================
+-- 7. TRIGGERS
+-- ============================================================================
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+CREATE TRIGGER guard_profile_columns_trg
+  BEFORE UPDATE ON public.profiles
+  FOR EACH ROW EXECUTE FUNCTION public.guard_profile_columns();
+
+CREATE TRIGGER ensure_role_rows_trg
+  AFTER INSERT OR UPDATE OF role ON public.profiles
+  FOR EACH ROW EXECUTE FUNCTION public.ensure_role_rows();
+
+CREATE TRIGGER audit_profile_changes
+  AFTER UPDATE ON public.profiles
+  FOR EACH ROW EXECUTE FUNCTION public.audit_profile_changes();
+
+CREATE TRIGGER sync_profile_intern
+  AFTER INSERT OR UPDATE OR DELETE ON public.interns
+  FOR EACH ROW EXECUTE FUNCTION public.sync_profile_links();
+
+CREATE TRIGGER sync_profile_supervisor
+  AFTER INSERT OR UPDATE OR DELETE ON public.supervisors
+  FOR EACH ROW EXECUTE FUNCTION public.sync_profile_links();
+
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['profiles','supervisors','interns','attendance',
+    'daily_journals','documents','evaluations','announcements','settings',
+    'institutions','programs']
+  LOOP
+    EXECUTE format(
+      'CREATE TRIGGER touch_%1$s BEFORE UPDATE ON public.%1$I
+         FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at()', t);
+  END LOOP;
+END $$;
+
+
+-- ============================================================================
+-- 8. ROW LEVEL SECURITY
+-- ============================================================================
+ALTER TABLE public.profiles           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.departments        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.supervisors        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.institutions       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.programs           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.interns            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.attendance         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.daily_journals     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.documents          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.evaluations        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.announcements      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.announcement_likes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.settings           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notifications      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.audit_logs         ENABLE ROW LEVEL SECURITY;
+
+-- ---- profiles: self, admin, supervisor->their interns, intern->their supervisor
+CREATE POLICY "profiles select scoped" ON public.profiles
+  FOR SELECT TO authenticated USING (
+    id = auth.uid()
+    OR public.is_admin()
+    OR intern_id IN (SELECT public.current_supervisor_intern_ids())
+    OR supervisor_id = (SELECT i.supervisor_id FROM public.interns i
+                         WHERE i.id = public.current_intern_id()));
+
+CREATE POLICY "users update own profile" ON public.profiles
+  FOR UPDATE TO authenticated
+  USING (id = auth.uid()) WITH CHECK (id = auth.uid());
+
+CREATE POLICY "admins manage profiles" ON public.profiles
+  FOR ALL TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+
+-- ---- departments / institutions / programs (shared reference data) ---------
+CREATE POLICY "departments readable" ON public.departments
+  FOR SELECT TO authenticated USING (true);
+CREATE POLICY "admins manage departments" ON public.departments
+  FOR ALL TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+
+CREATE POLICY "institutions readable" ON public.institutions
+  FOR SELECT TO authenticated USING (true);
+CREATE POLICY "admins manage institutions" ON public.institutions
+  FOR ALL TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+
+CREATE POLICY "programs readable" ON public.programs
+  FOR SELECT TO authenticated USING (true);
+CREATE POLICY "admins manage programs" ON public.programs
+  FOR ALL TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+
+-- ---- supervisors: self, admin, or the intern's own supervisor --------------
+CREATE POLICY "supervisors select scoped" ON public.supervisors
+  FOR SELECT TO authenticated USING (
+    public.is_admin()
+    OR id = public.current_supervisor_id()
+    OR id = (SELECT i.supervisor_id FROM public.interns i
+              WHERE i.id = public.current_intern_id()));
+CREATE POLICY "admins manage supervisors" ON public.supervisors
+  FOR ALL TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+
+-- ---- interns: access follows the CURRENT assignment ------------------------
+CREATE POLICY "interns select scoped" ON public.interns
+  FOR SELECT TO authenticated USING (
+    public.is_admin()
+    OR id = public.current_intern_id()
+    OR supervisor_id = public.current_supervisor_id());
+CREATE POLICY "admins manage interns" ON public.interns
+  FOR ALL TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+CREATE POLICY "supervisor inserts assigned interns" ON public.interns
+  FOR INSERT TO authenticated WITH CHECK (
+    public.current_supervisor_id() IS NOT NULL
+    AND supervisor_id = public.current_supervisor_id());
+CREATE POLICY "supervisor updates assigned interns" ON public.interns
+  FOR UPDATE TO authenticated
+  USING (supervisor_id = public.current_supervisor_id())
+  WITH CHECK (supervisor_id = public.current_supervisor_id());
+-- (no supervisor DELETE policy on purpose: removal is admin-only)
+
+-- ---- attendance (writes only through RPCs) ---------------------------------
+CREATE POLICY "attendance select scoped" ON public.attendance
+  FOR SELECT TO authenticated USING (
+    public.is_admin()
+    OR intern_id = public.current_intern_id()
+    OR intern_id IN (SELECT public.current_supervisor_intern_ids()));
+CREATE POLICY "admins manage attendance" ON public.attendance
+  FOR ALL TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+
+-- ---- daily journals --------------------------------------------------------
+CREATE POLICY "journals select scoped" ON public.daily_journals
+  FOR SELECT TO authenticated USING (
+    public.is_admin()
+    OR intern_id = public.current_intern_id()
+    OR intern_id IN (SELECT public.current_supervisor_intern_ids()));
+CREATE POLICY "admins manage journals" ON public.daily_journals
+  FOR ALL TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+CREATE POLICY "intern inserts own journals" ON public.daily_journals
+  FOR INSERT TO authenticated WITH CHECK (
+    intern_id = public.current_intern_id()
+    AND status = 'pending'
+    AND supervisor_comment IS NULL);
+
+-- ---- documents -------------------------------------------------------------
+CREATE POLICY "documents select scoped" ON public.documents
+  FOR SELECT TO authenticated USING (
+    public.is_admin()
+    OR intern_id = public.current_intern_id()
+    OR intern_id IN (SELECT public.current_supervisor_intern_ids()));
+CREATE POLICY "admins manage documents" ON public.documents
+  FOR ALL TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+CREATE POLICY "intern inserts own documents" ON public.documents
+  FOR INSERT TO authenticated WITH CHECK (
+    intern_id = public.current_intern_id()
+    AND status = 'pending'
+    AND reviewed_by IS NULL);
+CREATE POLICY "intern deletes own documents" ON public.documents
+  FOR DELETE TO authenticated USING (intern_id = public.current_intern_id());
+
+-- ---- evaluations (insert only via evaluation_create RPC) -------------------
+CREATE POLICY "evaluations select scoped" ON public.evaluations
+  FOR SELECT TO authenticated USING (
+    public.is_admin()
+    OR intern_id = public.current_intern_id()
+    OR supervisor_id = public.current_supervisor_id());
+CREATE POLICY "admins manage evaluations" ON public.evaluations
+  FOR ALL TO authenticated
+  USING (public.is_admin()) WITH CHECK (public.is_admin());
+
+-- ---- announcements (writes only via audited RPCs) --------------------------
+CREATE POLICY "announcements readable" ON public.announcements
+  FOR SELECT TO authenticated USING (true);
+
+CREATE POLICY "announcement likes readable" ON public.announcement_likes
+  FOR SELECT TO authenticated USING (true);
+CREATE POLICY "users insert own announcement like" ON public.announcement_likes
+  FOR INSERT TO authenticated WITH CHECK (user_id = auth.uid());
+CREATE POLICY "users delete own announcement like" ON public.announcement_likes
+  FOR DELETE TO authenticated USING (user_id = auth.uid());
+
+-- ---- settings --------------------------------------------------------------
+CREATE POLICY "settings readable" ON public.settings
+  FOR SELECT TO authenticated USING (true);
+CREATE POLICY "admins manage settings" ON public.settings
+  FOR ALL TO authenticated
+  USING (public.can_manage_settings()) WITH CHECK (public.can_manage_settings());
+
+-- ---- notifications (insert only via notify_user / notify_role) -------------
+CREATE POLICY "user reads own notifications" ON public.notifications
+  FOR SELECT TO authenticated USING (user_id = auth.uid());
+CREATE POLICY "user updates own notifications" ON public.notifications
+  FOR UPDATE TO authenticated
+  USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+CREATE POLICY "user deletes own notifications" ON public.notifications
+  FOR DELETE TO authenticated USING (user_id = auth.uid());
+
+-- ---- audit logs (append-only via write_audit_log / trigger) ----------------
+CREATE POLICY "admins read audit logs" ON public.audit_logs
+  FOR SELECT TO authenticated USING (public.is_admin());
+
+
+-- ============================================================================
+-- 9. STORAGE
+-- ============================================================================
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES ('intern-documents', 'intern-documents', false, 5242880,
+  ARRAY['application/pdf','image/png','image/jpeg','image/gif','image/webp',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'])
+ON CONFLICT (id) DO UPDATE
+  SET public = false,
+      file_size_limit = 5242880,
+      allowed_mime_types = ARRAY['application/pdf','image/png','image/jpeg',
+        'image/gif','image/webp','application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
+
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('institution-logos', 'institution-logos', true)
+ON CONFLICT (id) DO UPDATE SET public = true;
+
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('institution-moa', 'institution-moa', false)
+ON CONFLICT (id) DO UPDATE SET public = false;
+
+-- intern-documents: folder name = intern id
+CREATE POLICY "intern documents private read" ON storage.objects
+  FOR SELECT TO authenticated USING (
+    bucket_id = 'intern-documents'
+    AND (public.is_admin()
+      OR (storage.foldername(name))[1] = public.current_intern_id()::text
+      OR (storage.foldername(name))[1] IN (
+           SELECT public.current_supervisor_intern_ids()::text)));
+
+CREATE POLICY "intern documents owner write" ON storage.objects
+  FOR INSERT TO authenticated WITH CHECK (
+    bucket_id = 'intern-documents'
+    AND (storage.foldername(name))[1] = public.current_intern_id()::text);
+
+CREATE POLICY "intern documents owner delete" ON storage.objects
+  FOR DELETE TO authenticated USING (
+    bucket_id = 'intern-documents'
+    AND ((storage.foldername(name))[1] = public.current_intern_id()::text
+         OR public.is_admin()));
+
+CREATE POLICY "intern documents admin manage" ON storage.objects
+  FOR ALL TO authenticated
+  USING (bucket_id = 'intern-documents' AND public.is_admin())
+  WITH CHECK (bucket_id = 'intern-documents' AND public.is_admin());
+
+-- institution-logos: public read, admin write
+CREATE POLICY "institution_logos_public_read" ON storage.objects
+  FOR SELECT USING (bucket_id = 'institution-logos');
+CREATE POLICY "institution_logos_admin_upload" ON storage.objects
+  FOR INSERT TO authenticated
+  WITH CHECK (bucket_id = 'institution-logos' AND public.is_admin());
+CREATE POLICY "institution_logos_admin_delete" ON storage.objects
+  FOR DELETE TO authenticated
+  USING (bucket_id = 'institution-logos' AND public.is_admin());
+
+-- institution-moa: admin only
+CREATE POLICY "moa_admin_read" ON storage.objects
+  FOR SELECT TO authenticated
+  USING (bucket_id = 'institution-moa' AND public.is_admin());
+CREATE POLICY "moa_admin_upload" ON storage.objects
+  FOR INSERT TO authenticated
+  WITH CHECK (bucket_id = 'institution-moa' AND public.is_admin());
+CREATE POLICY "moa_admin_delete" ON storage.objects
+  FOR DELETE TO authenticated
+  USING (bucket_id = 'institution-moa' AND public.is_admin());
+
+
+-- ============================================================================
+-- 10. GRANTS (least privilege)
+-- ============================================================================
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE CREATE ON SCHEMA public FROM anon;
+REVOKE CREATE ON SCHEMA public FROM authenticated;
+
+-- anonymous users get nothing
+REVOKE ALL ON ALL TABLES    IN SCHEMA public FROM anon;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon;
+
+-- tables: baseline for logged-in users (RLS still applies), then tighten
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
+GRANT ALL ON ALL TABLES    IN SCHEMA public TO service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO authenticated;
+
+-- sensitive tables: the SECURITY DEFINER RPCs are the ONLY write path
+REVOKE INSERT, UPDATE          ON public.attendance    FROM authenticated;
+REVOKE INSERT, UPDATE, DELETE  ON public.announcements FROM authenticated;
+REVOKE INSERT, UPDATE          ON public.evaluations   FROM authenticated;
+REVOKE UPDATE                  ON public.documents     FROM authenticated;
+REVOKE UPDATE                  ON public.daily_journals FROM authenticated;
+REVOKE INSERT, UPDATE, DELETE  ON public.audit_logs    FROM authenticated;
+REVOKE INSERT, UPDATE          ON public.notifications FROM authenticated;
+GRANT  UPDATE (is_read, read_at) ON public.notifications TO authenticated;
+
+-- functions: nothing by default, then grant only what the app calls
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, anon, authenticated;
+GRANT  EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO service_role;
+
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN
+    SELECT p.oid::regprocedure AS sig
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND p.proname IN (
+         'current_role','is_admin','can_delete_users','can_manage_settings',
+         'current_intern_id','current_supervisor_id',
+         'current_supervisor_department_id','current_supervisor_intern_ids',
+         'profile_ids_by_role','supervisor_profile_id','intern_profile_id',
+         'attendance_today','attendance_hours','attendance_clock_in',
+         'attendance_clock_out','attendance_submit_claim',
+         'attendance_review_claim','journal_review','document_review',
+         'evaluation_create','notify_user','notify_role','write_audit_log',
+         'update_own_profile','announcement_create','announcement_update',
+         'announcement_delete')
+  LOOP
+    EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO authenticated', r.sig);
+  END LOOP;
+END $$;
+
+
+-- ============================================================================
+-- 11. RESTORE PROFILES FOR EXISTING LOGINS
+-- ============================================================================
+-- auth.users survives the reset, so recreate a profile for each existing login.
+-- >>> PUT YOUR ADMIN EMAIL BELOW <<<
+DO $$
+DECLARE
+  v_admin_email text := 'CHANGE_ME@example.com';
+BEGIN
+  INSERT INTO public.profiles (id, full_name, email, role)
+  SELECT u.id,
+         COALESCE(u.raw_user_meta_data ->> 'full_name', ''),
+         u.email,
+         CASE WHEN lower(u.email) = lower(v_admin_email)
+              THEN 'admin'::public.user_role
+              ELSE 'intern'::public.user_role END
+    FROM auth.users u
+  ON CONFLICT (id) DO NOTHING;
+
+  IF NOT EXISTS (SELECT 1 FROM public.profiles WHERE role = 'admin') THEN
+    RAISE NOTICE 'No admin exists. Edit v_admin_email and re-run section 11, or run: UPDATE public.profiles SET role = ''admin'' WHERE email = ''you@example.com'';';
+  END IF;
+END $$;
+
+
+-- ============================================================================
+-- 12. RELOAD POSTGREST SCHEMA CACHE
+-- ============================================================================
+NOTIFY pgrst, 'reload schema';
+
+COMMIT;
+
+-- ============================================================================
+-- VERIFY (run separately afterwards)
+-- ============================================================================
+--   select proname from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+--    where n.nspname='public' and proname in ('attendance_clock_in',
+--      'attendance_clock_out','attendance_submit_claim','attendance_review_claim',
+--      'journal_review','document_review','evaluation_create','notify_user');
+--   select id, email, role from public.profiles order by role;

@@ -1,0 +1,11 @@
+{
+  "providers": {
+    "opencode": {
+      "models": {
+        "muse-spark-1.2-contributor-free": {
+          "effort_levels": ["minimal", "low", "medium", "high", "xhigh"]
+        }
+      }
+    }
+  }
+}
