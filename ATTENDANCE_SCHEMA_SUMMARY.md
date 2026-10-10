@@ -251,7 +251,7 @@ Contains all date/time formatting and calculation utilities:
 ### Seed Data
 
 No seed data found in the codebase. The database migrations include:
-- `0026_seed_admin.sql` - Seeds the initial admin account (email: plas-admin@company.com, password: 123123123)
+- `0023_seed_admin.sql` - Seeds the initial admin account (email: plas-admin@company.com; password set at deploy time, NOT committed — see the file header)
 - Various consistency and RLP fixes for existing data
 
 ### Required Hours
