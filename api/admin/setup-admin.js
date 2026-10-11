@@ -150,7 +150,10 @@ export default async function handler(req, res) {
       email: String(email).trim(),
       password,
       email_confirm: true, // first admin is provisioned by an operator
-      user_metadata: { full_name: String(full_name).trim(), role: "admin" },
+      // SECURITY (S1): handle_new_user() reads the role from app_metadata,
+      // which only the service role can write.
+      app_metadata: { role: "admin" },
+      user_metadata: { full_name: String(full_name).trim() },
     });
     if (error) throw error;
     const authUser = data.user;

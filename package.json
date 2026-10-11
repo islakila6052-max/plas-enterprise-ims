@@ -9,6 +9,7 @@
     "start": "vite preview",
     "lint": "oxlint",
     "test": "oxlint --quiet && npm run build",
+    "test:db": "node --test \"supabase/tests/*.test.mjs\"",
     "audit": "npm audit --audit-level=moderate",
     "optimize:images": "node scripts/optimize-images.mjs"
   },

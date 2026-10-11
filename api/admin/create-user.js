@@ -136,9 +136,12 @@ try {
       email: createdEmail,
       password,
       email_confirm: true,
+      // SECURITY (S1): the role goes in app_metadata, which only the service
+      // role can write. handle_new_user() reads it from there. Never put the
+      // role in user_metadata: the user can change that field.
+      app_metadata: { role: requestedRole },
       user_metadata: {
         full_name: user_metadata?.full_name || "",
-        role: requestedRole,
       },
     });
 
@@ -149,7 +152,6 @@ try {
       await supabaseAdmin.auth.admin.inviteUserByEmail(createdEmail, {
         data: {
           full_name: user_metadata?.full_name || "",
-          role: requestedRole,
         },
         redirectTo: `${appBaseUrl}/login`,
       });
