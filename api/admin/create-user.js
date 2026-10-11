@@ -106,6 +106,13 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Invalid role for a new account." });
   }
 
+  // HR staff may provision operational accounts, not privileged HR accounts.
+  if (caller.role === "hr_staff" && !["supervisor", "intern"].includes(requestedRole)) {
+    return res.status(403).json({
+      error: "Forbidden: HR staff may create only supervisor and intern accounts.",
+    });
+  }
+
   // Validate required fields
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password are required" });
