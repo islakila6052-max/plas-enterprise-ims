@@ -15,8 +15,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { ATTENDANCE_STATUS, ATTENDANCE_STATUS_LABELS } from "@/lib/constants";
 import { formatDate, formatTime, formatHours } from "@/utils/format";
-import { recordAudit, notify } from "@/services/activityService";
-import { supabase } from "@/lib/supabase";
+import { recordAudit } from "@/services/activityService";
 
 const TONE = {
   present: "green",
@@ -109,31 +108,6 @@ export default function SupervisorAttendance() {
           comment,
         },
       });
-
-      // Notify the intern about the claim review
-      try {
-        const { data: intern } = await supabase
-          .from("interns")
-          .select("profile_id, full_name")
-          .eq("id", reviewRecord.intern_id)
-          .single();
-
-        if (intern?.profile_id) {
-          await notify({
-            user_id: intern.profile_id,
-            type: "attendance_update",
-            title: `Clock-out claim ${decision}`,
-            message:
-              decision === "approved"
-                ? `Your claimed clock-out for ${formatDate(reviewRecord.date)} was approved.`
-                : `Your claimed clock-out for ${formatDate(reviewRecord.date)} was rejected.`,
-            link: "/intern/attendance",
-            metadata: { attendance_id: reviewRecord.id, decision },
-          });
-        }
-      } catch {
-        /* non-fatal */
-      }
 
       toast.success(
         decision === "approved"

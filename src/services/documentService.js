@@ -1,7 +1,6 @@
 // src/services/documentService.js
 import { supabase } from "@/lib/supabase";
 import { logger } from "@/lib/logger";
-import { notify } from "@/services/activityService";
 
 const BUCKET = "intern-documents";
 
@@ -135,54 +134,6 @@ export const documentService = {
       .single();
     if (error) throw new Error(error.message);
 
-    // Notify supervisor + admin about new document
-    try {
-      const { data: intern } = await supabase
-        .from("interns")
-        .select("full_name, supervisor_id")
-        .eq("id", internId)
-        .single();
-
-      if (intern?.supervisor_id) {
-        // C4: `intern.supervisor_id` is a supervisors.id, not a profiles.id.
-        // Resolving it with a SECURITY DEFINER helper returns the auth user id
-        // without needing broad read access to the profiles table.
-        const { data: supProfileId } = await supabase.rpc(
-          "supervisor_profile_id",
-          { p_supervisor_row_id: intern.supervisor_id },
-        );
-        if (supProfileId) {
-          await notify({
-            user_id: supProfileId,
-            type: "document_review",
-            title: "New document submitted",
-            message: `${intern.full_name || "An intern"} submitted a document for review.`,
-            link: "/supervisor/documents",
-            metadata: { intern_id: internId, document_id: data.id },
-          });
-        }
-      }
-
-      // C4: notify admins. profile_ids_by_role() returns ONLY the uuid column, so
-      // this no longer requires reading every admin's profile row.
-      const { data: adminIds } = await supabase.rpc("profile_ids_by_role", {
-        p_role: "admin",
-      });
-
-      for (const adminId of adminIds || []) {
-        await notify({
-          user_id: adminId,
-          type: "document_review",
-          title: "New document submitted",
-          message: `${intern?.full_name || "An intern"} submitted a document for review.`,
-          link: "/admin/documents",
-          metadata: { intern_id: internId, document_id: data.id },
-        });
-      }
-    } catch (err) {
-      logger.error("[DOCUMENT NOTIFICATION] Failed:", err);
-    }
-
     return data;
   },
 
@@ -195,28 +146,6 @@ export const documentService = {
       p_status: status,
     });
     if (error) throw new Error(error.message);
-
-    // Notify intern about review
-    try {
-      const { data: document } = await supabase
-        .from("documents")
-        .select("*, intern:interns(full_name, profile_id)")
-        .eq("id", id)
-        .single();
-
-      if (document?.intern?.profile_id) {
-        await notify({
-          user_id: document.intern.profile_id,
-          type: "document_review",
-          title: `Document ${status}`,
-          message: `Your document "${document.file_name ?? document.label}" was ${status}.`,
-          link: "/intern/documents",
-          metadata: { document_id: id, status },
-        });
-      }
-    } catch (err) {
-      logger.error("[DOCUMENT REVIEW NOTIFICATION] Failed:", err);
-    }
 
     return data;
   },

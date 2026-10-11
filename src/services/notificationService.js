@@ -57,22 +57,4 @@ export const notificationService = {
     if (error) throw new Error(error.message);
     return;
   },
-
-  /** Create a notification for a user (routed through the notify_user RPC). */
-  async create(payload) {
-    // Fix: a direct INSERT is denied by RLS on `notifications` (the table only
-    // grants SELECT + UPDATE to `authenticated`), which is the
-    // `POST /rest/v1/notifications 403 (Forbidden)` error. Write through the
-    // SECURITY DEFINER RPC instead.
-    const { error } = await supabase.rpc("notify_user", {
-      p_user_id: payload.user_id,
-      p_type: payload.type,
-      p_title: payload.title,
-      p_message: payload.message,
-      p_link: payload.link ?? null,
-      p_metadata: payload.metadata ?? {},
-    });
-    if (error) throw new Error(error.message);
-    return payload;
-  },
 };

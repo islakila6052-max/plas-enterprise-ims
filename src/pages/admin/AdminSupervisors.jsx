@@ -23,8 +23,6 @@ import { useAuth } from "@/contexts/AuthContext";
 import { formatDate } from "@/utils/format";
 import {
   recordAudit,
-  notify,
-  notifyAllWithType,
   auditDiff,
   auditCreated,
   auditDeleted,
@@ -149,17 +147,6 @@ export default function AdminSupervisors() {
           ),
         });
 
-        // Notify the supervisor their account was updated.
-        if (editing.profile_id) {
-          await notify({
-            user_id: editing.profile_id,
-            type: "account_created",
-            title: "Your account was updated",
-            message: `${fullName}, your supervisor account details were updated by an admin.`,
-            link: "/supervisor",
-          }).catch(() => {});
-        }
-
         toast.success("Supervisor updated.");
       } else {
         const newUser = await userService.createAuthUser({
@@ -203,28 +190,6 @@ export default function AdminSupervisors() {
             email: values.email,
             department_id: values.department_id,
           }),
-        });
-
-        // ✅ Add notifications
-        if (newUser?.id) {
-          await notify({
-            user_id: newUser.id,
-            type: "account_created",
-            title: "Your supervisor account is ready",
-            message: `Welcome ${fullName}! You have been created as a supervisor. You can now log in and manage interns.`,
-            link: "/supervisor",
-          });
-        }
-
-        await notifyAllWithType({
-          type: "announcement",
-          title: "New supervisor created",
-          message: `${fullName} has been created as a new supervisor.`,
-          link: "/admin/supervisors",
-          metadata: {
-            supervisor_id: newUser?.id,
-            supervisor_name: fullName,
-          },
         });
 
         toast.success(`Supervisor ${fullName} created successfully!`);

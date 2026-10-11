@@ -17,7 +17,6 @@ import { announcementService } from "@/services/announcementService";
 import { useAuth } from "@/contexts/AuthContext";
 import { ANNOUNCEMENT_CATEGORIES } from "@/lib/constants";
 import { formatDate, formatTime } from "@/utils/format";
-import { notifyAllWithType } from "@/services/activityService";
 import ActionButton from "@/components/ui/ActionButton";
 
 export default function AdminAnnouncements() {
@@ -90,17 +89,6 @@ export default function AdminAnnouncements() {
         toast.success("Announcement updated.");
       } else {
         await announcementService.create({ ...values, title, body, published_by: user?.id });
-
-        // Notify all users about the new announcement.
-        notifyAllWithType({
-          type: "announcement",
-          title: `New announcement: ${title}`,
-          message:
-            body.substring(0, 120) +
-            (body.length > 120 ? "…" : ""),
-          link: "/intern/announcements",
-          metadata: { category: values.category },
-        }).catch(() => {});
 
         toast.success("Announcement published.");
       }

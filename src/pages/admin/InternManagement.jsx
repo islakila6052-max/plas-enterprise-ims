@@ -36,7 +36,6 @@ import { formatDate } from "@/utils/format";
 import { logger } from "@/lib/logger";
 import {
   recordAudit,
-  notify,
   auditDiff,
   auditDeleted,
 } from "@/services/activityService";
@@ -306,23 +305,6 @@ export default function InternManagement() {
           ),
         });
 
-        // Notify if supervisor changed.
-        if (
-          payload.supervisor_id &&
-          payload.supervisor_id !== editing.supervisor_id
-        ) {
-          const sup = supervisors.find((x) => x.id === payload.supervisor_id);
-          if (sup?.profile_id) {
-            await notify({
-              user_id: sup.profile_id,
-              type: "intern_assigned",
-              title: "Intern reassigned",
-              message: `${fullName} was reassigned to you.`,
-              link: "/supervisor/interns",
-            }).catch(() => {});
-          }
-        }
-
         toast.success("Intern updated.");
       } else {
         // Create a real auth user + linked intern record so the intern can log in.
@@ -348,26 +330,6 @@ export default function InternManagement() {
             supervisor_id: payload.supervisor_id,
           },
         });
-        if (payload.supervisor_id) {
-          const sup = supervisors.find((x) => x.id === payload.supervisor_id);
-          if (sup?.profile_id)
-            await notify({
-              user_id: sup.profile_id,
-              type: "intern_assigned",
-              title: "New intern assigned",
-              message: fullName + " was assigned to you.",
-              link: "/supervisor/interns",
-            });
-        }
-        if (newUser.id) {
-          await notify({
-            user_id: newUser.id,
-            type: "account_created",
-            title: "Your account is ready",
-            message: "Your internship account was created. You can now log in.",
-            link: "/intern",
-          });
-        }
         toast.success("Intern added.");
       }
       setModalOpen(false);
@@ -403,29 +365,9 @@ export default function InternManagement() {
     try {
       if (confirm.type === "archive") {
         await internService.archive(confirm.row.id);
-        // Notify the intern.
-        if (confirm.row.profile_id) {
-          await notify({
-            user_id: confirm.row.profile_id,
-            type: "intern_status",
-            title: "Internship archived",
-            message: "Your internship record has been archived.",
-            link: "/intern",
-          }).catch(() => {});
-        }
         toast.success("Intern archived.");
       } else if (confirm.type === "restore") {
         await internService.restore(confirm.row.id);
-        // Notify the intern.
-        if (confirm.row.profile_id) {
-          await notify({
-            user_id: confirm.row.profile_id,
-            type: "intern_status",
-            title: "Internship restored",
-            message: "Your internship record has been reactivated.",
-            link: "/intern",
-          }).catch(() => {});
-        }
         toast.success("Intern restored.");
       } else {
         await internService.remove(confirm.row.id);

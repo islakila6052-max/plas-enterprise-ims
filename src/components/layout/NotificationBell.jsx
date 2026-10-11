@@ -154,7 +154,11 @@ export default function NotificationBell() {
       }
     }
     setOpen(false);
-    if (n.link) navigate(n.link);
+    // Notifications can contain legacy links. Navigate only to internal paths.
+    if (typeof n.link === "string" && n.link.startsWith("/") &&
+        !n.link.startsWith("//") && !n.link.includes("\\") && !/\p{Cc}/u.test(n.link)) {
+      navigate(n.link);
+    }
   }
 
   async function handleMarkAll() {

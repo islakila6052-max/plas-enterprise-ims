@@ -16,8 +16,7 @@ import { supervisorService } from "@/services/supervisorService";
 import { useAuth } from "@/contexts/AuthContext";
 import { EVALUATION_CRITERIA, EVALUATION_RECOMMENDATIONS } from "@/lib/constants";
 import { formatDate } from "@/utils/format";
-import { recordAudit, notify } from "@/services/activityService";
-import { supabase } from "@/lib/supabase";
+import { recordAudit } from "@/services/activityService";
 import { logger } from "@/lib/logger";
 
 const REC_LABEL = Object.fromEntries(EVALUATION_RECOMMENDATIONS.map((r) => [r.value, r.label]));
@@ -120,27 +119,6 @@ export default function SupervisorEvaluations() {
         status: "pending",
       });
       await recordAudit({ user_id: user?.id, action: "create", resource_type: "evaluation", resource_id: values.intern_id, changes: { intern_id: values.intern_id, overall_rating: Number(values.overall_rating) || 0 } });
-
-      // Notify the intern that they received an evaluation.
-      try {
-        const { data: intern } = await supabase
-          .from("interns")
-          .select("full_name, profile_id")
-          .eq("id", values.intern_id)
-          .single();
-        if (intern?.profile_id) {
-          await notify({
-            user_id: intern.profile_id,
-            type: "evaluation_submitted",
-            title: "New evaluation received",
-            message: `Your supervisor submitted a new evaluation for you.`,
-            link: "/intern/evaluation",
-            metadata: { intern_id: values.intern_id, overall_rating: Number(values.overall_rating) || 0 },
-          });
-        }
-      } catch {
-        /* non-fatal */
-      }
 
       toast.success("Evaluation submitted.");
       setModalOpen(false);

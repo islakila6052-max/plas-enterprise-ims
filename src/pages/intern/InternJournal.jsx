@@ -22,8 +22,7 @@ import { journalService } from "@/services/journalService";
 import { useAuth } from "@/contexts/AuthContext";
 import { JOURNAL_STATUS_LABELS } from "@/lib/constants";
 import { formatDate, formatHours, todayISO } from "@/utils/format";
-import { recordAudit, notify } from "@/services/activityService";
-import { supabase } from "@/lib/supabase";
+import { recordAudit } from "@/services/activityService";
 import JournalDetailModal from "@/components/journal/JournalDetailModal";
 import MonthProgress from "@/components/journal/MonthProgress";
 import SubmitCelebration from "@/components/journal/SubmitCelebration";
@@ -255,35 +254,6 @@ export default function InternJournal() {
         status: "pending",
       });
       await recordAudit({ user_id: profile?.id, action: "create", resource_type: "daily_journal", resource_id: created?.id, changes: { date: values.date } });
-
-      // Notify the assigned supervisor about the new journal entry.
-      try {
-        const { data: intern } = await supabase
-          .from("interns")
-          .select("full_name, supervisor_id")
-          .eq("id", internId)
-          .single();
-        if (intern?.supervisor_id) {
-          // `intern.supervisor_id` is a supervisors.id, so resolve it through
-          // the SECURITY DEFINER helper (profiles is no longer listable).
-          const { data: supProfileId } = await supabase.rpc(
-            "supervisor_profile_id",
-            { p_supervisor_row_id: intern.supervisor_id },
-          );
-          if (supProfileId) {
-            await notify({
-              user_id: supProfileId,
-              type: "journal_submitted",
-              title: "New journal entry",
-              message: `${profile?.full_name || "An intern"} submitted a journal entry for ${values.date}.`,
-              link: "/supervisor/journals",
-              metadata: { intern_id: internId, journal_id: created?.id },
-            });
-          }
-        }
-      } catch {
-        /* non-fatal */
-      }
 
       toast.success("Journal submitted.");
       reset({ date: todayISO(), activities: "", hours_worked: "", challenges: "", learnings: "" });

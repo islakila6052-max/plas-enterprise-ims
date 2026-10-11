@@ -23,8 +23,7 @@ import {
   todayDateInAttendanceTZ,
   nowMinuteInAttendanceTZ,
 } from "@/utils/format";
-import { recordAudit, notify } from "@/services/activityService";
-import { supabase } from "@/lib/supabase";
+import { recordAudit } from "@/services/activityService";
 
 const TONE = {
   present: "green",
@@ -112,35 +111,6 @@ export default function InternAttendance() {
         changes: { type: "time_in", date: todayDateInAttendanceTZ() },
       });
 
-      // Notify supervisor
-      try {
-        const { data: intern } = await supabase
-          .from("interns")
-          .select("full_name, supervisor_id")
-          .eq("id", internId)
-          .single();
-        if (intern?.supervisor_id) {
-          // `intern.supervisor_id` is a supervisors.id, so resolve it through
-          // the SECURITY DEFINER helper (profiles is no longer listable).
-          const { data: supProfileId } = await supabase.rpc(
-            "supervisor_profile_id",
-            { p_supervisor_row_id: intern.supervisor_id },
-          );
-          if (supProfileId) {
-            await notify({
-              user_id: supProfileId,
-              type: "attendance_update",
-              title: "Time in recorded",
-              message: `${intern.full_name || "Your intern"} just timed in for ${todayDateInAttendanceTZ()}.`,
-              link: "/supervisor/attendance",
-              metadata: { intern_id: internId },
-            });
-          }
-        }
-      } catch {
-        /* non-fatal */
-      }
-
       toast.success("Timed in.");
       load();
     } catch (err) {
@@ -173,35 +143,6 @@ export default function InternAttendance() {
         resource_id: open.id,
         changes: { type: "time_out", timeOut, remarks },
       });
-
-      // Notify supervisor
-      try {
-        const { data: intern } = await supabase
-          .from("interns")
-          .select("full_name, supervisor_id")
-          .eq("id", internId)
-          .single();
-        if (intern?.supervisor_id) {
-          // `intern.supervisor_id` is a supervisors.id, so resolve it through
-          // the SECURITY DEFINER helper (profiles is no longer listable).
-          const { data: supProfileId } = await supabase.rpc(
-            "supervisor_profile_id",
-            { p_supervisor_row_id: intern.supervisor_id },
-          );
-          if (supProfileId) {
-            await notify({
-              user_id: supProfileId,
-              type: "attendance_update",
-              title: "Time out recorded",
-              message: `${intern.full_name || "Your intern"} timed out for ${formatDate(open.date)}.`,
-              link: "/supervisor/attendance",
-              metadata: { intern_id: internId },
-            });
-          }
-        }
-      } catch {
-        /* non-fatal */
-      }
 
       toast.success("Timed out.");
       setShowTimeOutForm(false);

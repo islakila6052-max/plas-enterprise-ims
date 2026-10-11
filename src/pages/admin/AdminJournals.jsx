@@ -20,7 +20,7 @@ import {
   PAGE_SIZE,
 } from "@/lib/constants";
 import { formatDate } from "@/utils/format";
-import { recordAudit, notify } from "@/services/activityService";
+import { recordAudit } from "@/services/activityService";
 import { useAuth } from "@/contexts/AuthContext";
 import ActionButton from "@/components/ui/ActionButton";
 
@@ -95,16 +95,6 @@ export default function AdminJournals() {
         resource_id: reviewing.id,
         changes: { status: decision },
       });
-      // Notify the intern who owns this journal that it was reviewed.
-      if (reviewing.intern?.profile_id) {
-        await notify({
-          user_id: reviewing.intern.profile_id,
-          type: "journal_review",
-          title: `Journal ${decision}`,
-          message: `Your journal for ${formatDate(reviewing.date)} was ${decision}.`,
-          link: "/intern/journal",
-        });
-      }
       toast.success(`Journal ${decision}.`);
       setReviewing(null);
       load();

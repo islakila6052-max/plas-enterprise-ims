@@ -192,9 +192,8 @@ export const supervisorService = {
     // is set to NULL by the FK, preserving their records.
     await supabase.from("evaluations").delete().eq("supervisor_id", id);
     await supabase.from("daily_journals").delete().eq("supervisor_id", id);
-    if (supData?.profile_id) {
-      await supabase.from("notifications").delete().eq("user_id", supData.profile_id);
-    }
+    // The supervisor DELETE trigger cleans notifications without browser access
+    // to another user's notification rows.
 
     // Delete the supervisor record.
     const { error: deleteError } = await supabase
